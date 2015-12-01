@@ -38,8 +38,18 @@ module Jetpants
     
     ##### METHOD OVERRIDES #####################################################
 
+    def load_shard_pools
+      @shard_pools = configuration_assets('MYSQL_SHARD_POOL').map(&:to_shard_pool)
+      @shard_pools.compact!
+      @shard_pools.sort_by! { |p| p.name }
+
+      true
+    end
+
     # Initializes list of pools + shards from Collins
     def load_pools
+      load_shard_pools if @shard_pools.nil?
+
       # We keep a cache of Collins::Asset objects, organized as pool_name => role => [asset, asset, ...]
       @pool_role_assets = {}
 
@@ -71,6 +81,15 @@ module Jetpants
       true
     end
 
+    def add_shard_pool(shard_pool)
+      raise 'Attempt to add a non shard pool to the sharding pools topology' unless shard_pool.is_a?(ShardPool)
+
+      unless shard_pools.include? shard_pool
+        @shard_pools << shard_pool
+        @shard_pools.sort_by! { |sp| sp.name }
+      end
+    end
+
     # Returns (count) DB objects.  Pulls from machines in the spare state
     # and converts them to the Allocated status.
     # You can pass in :role to request spares with a particular secondary_role
@@ -78,9 +97,29 @@ module Jetpants
       return [] if count == 0
       assets = query_spare_assets(count, options)
       raise "Not enough spare machines available! Found #{assets.count}, needed #{count}" if assets.count < count
-      assets.map do |asset|
-        asset.to_db.claim!
+      claimed_dbs = assets.map do |asset|
+        db = asset.to_db
+        db.claim!
+        if options[:for_pool]
+          options[:for_pool].claimed_nodes << db unless options[:for_pool].claimed_nodes.include? db
+        end
+
+        db
       end
+
+      if options[:for_pool]
+        compare_pool = options[:for_pool]
+      elsif options[:like] && options[:like].pool
+        compare_pool = options[:like].pool
+      else
+        compare_pool = false
+      end
+
+      if(compare_pool && claimed_dbs.select{|db| db.proximity_score(compare_pool) > 0}.count > 0)
+        compare_pool.output "Unable to claim #{count} nodes with an ideal proximity score!" 
+      end
+
+      claimed_dbs
     end
 
     # This method won't ever return a number higher than 100, but that's
@@ -88,13 +127,18 @@ module Jetpants
     def count_spares(options={})
       query_spare_assets(100, options).count
     end
-    
-    
+
+    # This method won't ever return more than than 100 nodes, but that's
+    # not a problem, since no single operation requires that many spares
+    def spares(options={})
+      query_spare_assets(100, options).map(&:to_db)
+    end
+
     ##### NEW METHODS ##########################################################
 
-    def db_location_report(shards_only = false)
-      if shards_only
-        pools_to_consider = shards
+    def db_location_report(shards_only = nil)
+      unless shards_only.nil?
+        pools_to_consider = shards(shards_only)
       else
         pools_to_consider = pools
       end
@@ -103,7 +147,7 @@ module Jetpants
       pools_to_consider.reduce(global_map){ |map, shard| map.deep_merge!(shard.db_layout,Hash::DEEP_MERGE_CONCAT) }
       global_map
     end
-    
+
     # Returns an array of Collins::Asset objects meeting the given criteria.
     # Caches the result for subsequent use.
     # Optionally supply a pool name to restrict the result to that pool.
@@ -147,8 +191,8 @@ module Jetpants
         selector[:page] = page
         # find() apparently alters the selector object now, so we dup it
         # also force JetCollins to retry requests to the Collins server
-        results = Plugin::JetCollins.find selector.dup, true
-        done = results.count < per_page
+        results = Plugin::JetCollins.find selector.dup, true, page == 0
+        done = (results.count < per_page) || (results.count == 0 && page > 0) 
         page += 1
         assets.concat(results.select {|a| a.pool}) # filter out any spare nodes, which will have no pool set
       end
@@ -184,19 +228,18 @@ module Jetpants
         operation:    'and',
         details:      true,
         size:         per_page,
-        query:        'status != ^DECOMMISSIONED$',
+        query:        'status != ^DECOMMISSIONED$ AND type = ^CONFIGURATION$',
       }
 
       if primary_roles.count == 1
-        selector[:type] = '^CONFIGURATION$'
         selector[:primary_role] = primary_roles.first
       else
         values = primary_roles.map {|r| "primary_role = ^#{r}$"}
-        selector[:query] += ' AND type = ^CONFIGURATION$ AND (' + values.join(' OR ') + ')'
+        selector[:query] += ' AND (' + values.join(' OR ') + ')'
       end
       
       selector[:remoteLookup] = true if Jetpants.plugins['jetpants_collins']['remote_lookup']
-      
+
       done = false
       page = 0
       assets = []
@@ -204,10 +247,10 @@ module Jetpants
         selector[:page] = page
         # find() apparently alters the selector object now, so we dup it
         # also force JetCollins to retry requests to the Collins server
-        page_of_results = Plugin::JetCollins.find selector.dup, true
+        page_of_results = Plugin::JetCollins.find selector.dup, true, page == 0
         assets += page_of_results
-        done = page_of_results.count < per_page
         page += 1
+        done = (page_of_results.count < per_page) || (page_of_results.count == 0 && page > 0)
       end
       
       # If remote lookup is enabled, remove the remote copy of any pool that exists
@@ -251,6 +294,8 @@ module Jetpants
     
     # Helper method to query Collins for spare DBs.
     def query_spare_assets(count, options={})
+      per_page = Jetpants.plugins['jetpants_collins']['selector_page_size'] || 50
+
       # Intentionally no remoteLookup=true here.  We only want to grab spare nodes
       # from the datacenter that Jetpants is running in.
       selector = {
@@ -260,42 +305,84 @@ module Jetpants
         status:           'Allocated',
         state:            'SPARE',
         primary_role:     'DATABASE',
-        size:             100,
+        size:             per_page,
       }
       selector = process_spare_selector_options(selector, options)
       source = options[:like]
+
+      done = false
+      page = 0
+      nodes = []
+      until done do
+        selector[:page] = page
+        # find() apparently alters the selector object now, so we dup it
+        # also force JetCollins to retry requests to the Collins server
+        page_of_results = Plugin::JetCollins.find selector.dup, true, page == 0
+        nodes += page_of_results
+        done = (page_of_results.count < per_page) || (page_of_results.count == 0 && page > 0)
+        page += 1
+      end
       
-      nodes = Plugin::JetCollins.find(selector)
-      keep_nodes = []
+      keep_assets = []
       
-      # Probe concurrently for speed reasons
       nodes.map(&:to_db).concurrent_each {|db| db.probe rescue nil}
-      
-      # Now iterate in a single-threaded way for simplicity
-      nodes.each do |node|
+      nodes.concurrent_each do |node|
         db = node.to_db
-        if(db.usable_spare? && (!source || db.usable_with?(source)))
-          keep_nodes << node
-          break if keep_nodes.size >= count
+        if(db.usable_spare? &&
+          (
+            !source ||
+            (!source.pool && db.usable_with?(source)) ||
+            (
+              (!options[:for_pool] && source.pool && db.usable_in?(source.pool)) ||
+              (options[:for_pool] && db.usable_in?(options[:for_pool]))
+            )
+          )
+        )
+          keep_assets << node
         end
       end
-      keep_nodes.slice(0,count)
+
+      if options[:for_pool]
+        compare_pool = options[:for_pool]
+      elsif source && source.pool
+        compare_pool = source.pool
+      else
+        compare_pool = false
+      end
+
+      # here we compare nodes against the optionally provided source to attempt to
+      # claim a node which is not physically local to the source nodes
+      if compare_pool
+        keep_assets = sort_assets_for_pool(compare_pool, keep_assets)
+      end
+
+      keep_assets.slice(0,count)
+    end
+
+    def sort_assets_for_pool(pool, assets)
+      assets.sort! do |lhs, rhs|
+        lhs.to_db.proximity_score(pool) <=> rhs.to_db.proximity_score(pool)
+      end
+
+      assets
     end
 
     def sort_pools_callback(pool)
       asset = pool.collins_asset
       role = asset.primary_role.upcase
+      shard_pool_name = ''
 
       case role
         when 'MYSQL_POOL'
           position = (asset.config_sort_order || 0).to_i
         when 'MYSQL_SHARD'
           position = asset.shard_min_id.to_i
+          shard_pool_name = pool.shard_pool.name
         else
           position = 0
       end
 
-      [role, position]
+      [role, shard_pool_name, position]
     end
 
   end

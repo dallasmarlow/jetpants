@@ -17,8 +17,8 @@ module Jetpants
       
       puts "You may clone to particular IP address(es), or can type \"spare\" to claim a node from the spare pool."
       target = options[:target] || ask('Please enter comma-separated list of targets (IPs or "spare") to clone to: ')
-      spares_needed = target.split(',').count {|t| t.strip.upcase == 'SPARE'}
       target = 'spare' if target.strip == '' || target.split(',').length == 0
+      spares_needed = target.split(',').count {|t| t.strip.upcase == 'SPARE'}
       if spares_needed > 0
         spares_available = Jetpants.topology.count_spares(role: :standby_slave, like: source, version: Plugin::UpgradeHelper.new_version)
         raise "Not enough upgraded spares with role of standby slave! Requested #{spares_needed} but only have #{spares_available} available." if spares_needed > spares_available
@@ -37,12 +37,15 @@ module Jetpants
       end
       
       source.start_mysql if ! source.running?
-      error "source (#{source}) is not a standby slave" unless source.is_standby?
+      error "source (#{source}) is not a standby slave or a backup slave" unless (source.is_standby? || source.for_backups?)
       
       targets.each do |t|
         error "target #{t} already has a master; please clear out node (including in asset tracker) before proceeding" if t.master
       end
-      
+     
+      # Claim all the targets from the pool
+      targets.each(&:claim!)
+
       # Disable fast shutdown on the source
       source.mysql_root_cmd 'SET GLOBAL innodb_fast_shutdown = 0'
       
@@ -119,10 +122,14 @@ module Jetpants
     method_option :reads,   :desc => 'Move reads to the new master', :type => :boolean
     method_option :writes,  :desc => 'Move writes to new master', :type => :boolean
     method_option :cleanup, :desc => 'Tear down the old-version nodes', :type => :boolean
+    method_option :shard_pool, :desc => 'The sharding pool for which to perform the upgrade'
     def shard_upgrade
+      shard_pool = options[:shard_pool] || ask('Please enter the sharding pool which to perform the action on (enter for default pool): ')
+      shard_pool = Jetpants.topology.default_shard_pool if shard_pool.empty?
+
       if options[:reads]
         raise 'The --reads, --writes, and --cleanup options are mutually exclusive' if options[:writes] || options[:cleanup]
-        s = ask_shard_being_upgraded :reads
+        s = ask_shard_being_upgraded(:reads, shard_pool)
         s.branched_upgrade_move_reads
         Jetpants.topology.write_config
         self.class.reminders(
@@ -133,7 +140,7 @@ module Jetpants
         )
       elsif options[:writes]
         raise 'The --reads, --writes, and --cleanup options are mutually exclusive' if options[:reads] || options[:cleanup]
-        s = ask_shard_being_upgraded :writes
+        s = ask_shard_being_upgraded(:writes, shard_pool)
         s.branched_upgrade_move_writes
         Jetpants.topology.write_config
         self.class.reminders(
@@ -145,7 +152,7 @@ module Jetpants
         
       elsif options[:cleanup]
         raise 'The --reads, --writes, and --cleanup options are mutually exclusive' if options[:reads] || options[:writes]
-        s = ask_shard_being_upgraded :cleanup
+        s = ask_shard_being_upgraded(:cleanup, shard_pool)
         s.cleanup!
         
       else
@@ -153,7 +160,7 @@ module Jetpants
           'This process may take an hour or two. You probably want to run this from a screen session.',
           'Be especially careful if you are relying on SSH Agent Forwarding for your root key, since this is not screen-friendly.'
         )
-        s = ask_shard_being_upgraded :prep
+        s = ask_shard_being_upgraded(:prep, shard_pool)
         s.branched_upgrade_prep
         self.class.reminders(
           'Proceed to next step: jetpants shard_upgrade --reads'
@@ -164,28 +171,49 @@ module Jetpants
     
     desc 'checksum_pool', 'Run pt-table-checksum on a pool to verify data consistency after an upgrade of one slave'
     method_option :pool,  :desc => 'name of pool'
+    method_option :no_check_plan, :desc => 'sets --nocheck_plan option in pt-table-checksum', :type => :boolean
+    method_option :chunk_time, :desc => 'adjust the chunk size dynamically so each checksum query takes this long to execute - if unsure about table sizes start at 0.05' # http://www.percona.com/doc/percona-toolkit/2.2/pt-table-checksum.html#cmdoption-pt-table-checksum--chunk-time
+    method_option :chunk_size_limit, :desc => 'safty valve - do not checksum chunks this much larger than the desired chunk size' # http://www.percona.com/doc/percona-toolkit/2.2/pt-table-checksum.html#cmdoption-pt-table-checksum--chunk-size-limit
+    method_option :tables, :desc => 'comma seperated list of tables to checksum'
     def checksum_pool
       pool_name = options[:pool] || ask('Please enter name of pool to checksum: ')
       pool = Jetpants.topology.pool(pool_name) or raise "Pool #{pool_name} does not exist"
-      pool.checksum_tables
+      checksum_options ||= {}
+      checksum_options[:no_check_plan] = options[:no_check_plan] || false
+      checksum_options[:chunk_time] = options[:chunk_time] || 0.1
+      checksum_options[:chunk_size_limit] = options[:chunk_size_limit] if options[:chunk_size_limit]
+      if options[:tables]
+        checksum_options[:tables] = options[:tables].split(',').map do |table|
+          raise "Pool #{pool_name} does not contain a table named #{table}}" unless pool.has_table? table
+          table
+        end
+      end
+
+      pool.checksum_tables checksum_options
     end
     
     
     desc 'check_pool_queries', 'Runs pt-upgrade on a pool to verify query performance and results between different MySQL versions'
     method_option :pool, :desc => 'name of pool'
     method_option :dumptime, :desc => 'number of seconds of tcpdump data to consider'
+    method_option :machines, :desc => 'machines to compare typically a new and old version of mysql'
+    method_option :gather_machine, :desc => 'machine to gather queries from'
     def check_pool_queries
       pool_name = options[:pool] || ask('Please enter name of pool to checksum: ')
       dump_time = options[:dumptime].to_i if options[:dumptime]
-      dump_time ||= 30
+      dump_time ||= 300
+      machines = options[:machines].split(',').map(&:to_db) if options[:machines]
+      machines ||= []
+      gather_machine = options[:gather_machine].to_db if options[:gather_machine]
+      gather_machine ||= nil
       
       pool = Jetpants.topology.pool(pool_name) or raise "Pool #{pool_name} does not exist"
-      pool.collect_and_compare_queries!(dump_time)
+      pool.collect_and_compare_queries!(dump_time, *machines)
     end
     
     no_tasks do
-      def ask_shard_being_upgraded(stage=:prep)
-        shards_being_upgraded = Jetpants.shards.select {|s| [:child, :needs_cleanup].include?(s.state) && !s.parent && s.master.master}
+      def ask_shard_being_upgraded(stage = :prep, shard_pool = nil)
+        shards_being_upgraded = Jetpants.shards(shard_pool).select {|s| [:child, :needs_cleanup].include?(s.state) && !s.parent && s.master.master}
         if stage == :writes || stage == :cleanup
           if shards_being_upgraded.size == 0
             raise 'No shards are currently being upgraded. You can only use this task after running "jetpants shard_upgrade".'

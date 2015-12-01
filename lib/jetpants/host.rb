@@ -40,7 +40,7 @@ module Jetpants
     
     # Returns a Host object for the machine Jetpants is running on.
     def self.local(interface=false)
-      interface ||= Jetpants.private_interface
+      interface ||= (Jetpants.local_private_interface || Jetpants.private_interface)
       # This technique is adapted from Sergio Rubio Gracia's, described at
       # http://blog.frameos.org/2006/12/09/getting-network-interface-addresses-using-ioctl-pure-ruby-2/
       sock = Socket.new(Socket::AF_INET, Socket::SOCK_DGRAM,0)
@@ -147,7 +147,20 @@ module Jetpants
       raise "Nothing is listening on #{@ip}:#{port} after #{timeout} seconds" unless checker_th.join(timeout)
       true
     end
-    
+
+    def manage_free_mem(free_mem_limit_mb)
+      return if free_mem_limit_mb == 0
+      loop do
+        current_free_mem = ssh_cmd("free -m | grep Mem | awk {'print $4'}").rstrip.to_i
+        ssh_cmd("echo 1 > /proc/sys/vm/drop_caches") if current_free_mem < free_mem_limit_mb
+        sleep(60)
+      end
+    end
+
+    def watch_free_mem(free_mem_limit_mb)
+      Thread.new{ manage_free_mem(free_mem_limit_mb) }
+    end
+
     # Returns true if the host is accessible via SSH, false otherwise
     def available?
       # If we haven't tried an ssh command yet, @available will be nil. Running
@@ -201,11 +214,25 @@ module Jetpants
       else
         output "Compression disabled -- no compression method specified in Jetpants config file"
       end
+
+      should_encrypt = false
+      targets.each do |t|
+        should_encrypt = should_encrypt || should_encrypt_with?(t)
+      end
+
+      if Jetpants.encrypt_with && Jetpants.decrypt_with && should_encrypt
+        enc_bin = Jetpants.encrypt_with.split(' ')[0]
+        confirm_installed enc_bin
+        output "Using #{enc_bin} for encryption"
+      else
+        output "Not encrypting data stream, either no encryption method specified or encryption unneeded with target"
+      end
       
       # On each destination host, do any initial setup (and optional validation/erasing),
       # and then listen for new files.  If there are multiple destination hosts, all of them
       # except the last will use tee to "chain" the copy along to the next machine.
       workers = []
+      free_mem_managers = []
       targets.reverse.each_with_index do |t, i|
         dir = destinations[t]
         raise "Directory #{t}:#{dir} looks suspicious" if dir.include?('..') || dir.include?('./') || dir == '/' || dir == ''
@@ -214,6 +241,12 @@ module Jetpants
           decomp_bin = Jetpants.decompress_with.split(' ')[0]
           t.confirm_installed decomp_bin
         end
+
+        if Jetpants.encrypt_with && Jetpants.decrypt_with && should_encrypt
+          decrypt_bin = Jetpants.decrypt_with.split(' ')[0]
+          t.confirm_installed decrypt_bin
+        end
+
         t.ssh_cmd "mkdir -p #{dir}"
         
         # Check if contents already exist / non-empty.
@@ -225,8 +258,9 @@ module Jetpants
         end
         
         decompression_pipe = Jetpants.decompress_with ? "| #{Jetpants.decompress_with}" : ''
+        decryption_pipe = (Jetpants.decrypt_with && should_encrypt) ? "| #{Jetpants.decrypt_with}" : ''
         if i == 0
-          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} #{decompression_pipe} | tar xv" }
+          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} #{decryption_pipe} #{decompression_pipe} | tar xv" }
           t.confirm_listening_on_port port
           t.output "Listening with netcat."
         else
@@ -235,23 +269,33 @@ module Jetpants
           workers << Thread.new { t.ssh_cmd "cd #{dir} && mkfifo #{fifo} && nc #{tt.ip} #{port} <#{fifo} && rm #{fifo}" }
           checker_th = Thread.new { t.ssh_cmd "while [ ! -p #{dir}/#{fifo} ] ; do sleep 1; done" }
           raise "FIFO not found on #{t} after 10 tries" unless checker_th.join(10)
-          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} | tee #{fifo} #{decompression_pipe} | tar xv" }
+          workers << Thread.new { t.ssh_cmd "cd #{dir} && nc -l #{port} | tee #{fifo} #{decryption_pipe} #{decompression_pipe} | tar xv" }
           t.confirm_listening_on_port port
           t.output "Listening with netcat, and chaining to #{tt}."
         end
+        free_mem_managers << t.watch_free_mem(Jetpants.free_mem_min_mb || 0)
       end
       
       # Start the copy chain.
       output "Sending files over to #{targets[0]}: #{file_list}"
       compression_pipe = Jetpants.compress_with ? "| #{Jetpants.compress_with}" : ''
-      ssh_cmd "cd #{base_dir} && tar vc #{file_list} #{compression_pipe} | nc #{targets[0].ip} #{port}"
+      encryption_pipe = (Jetpants.encrypt_with && should_encrypt) ? "| #{Jetpants.encrypt_with}" : ''
+      ssh_cmd "cd #{base_dir} && tar vc #{file_list} #{compression_pipe} #{encryption_pipe} | nc #{targets[0].ip} #{port}"
       workers.each {|th| th.join}
       output "File copy complete."
-      
+
+      free_mem_managers.each(&:exit)
+
       # Verify
       output "Verifying file sizes and types on all destinations."
       compare_dir base_dir, destinations, options
       output "Verification successful."
+    end
+
+    # Add a hook point to determine whether a host should encrypt a data stream between two hosts
+    # This is useful to avoid encryption latency in a secure environment
+    def should_encrypt_with?(host)
+      Jetpants.encrypt_file_transfers
     end
     
     # Given the name of a directory or single file, returns a hash of filename => size of each file present.
